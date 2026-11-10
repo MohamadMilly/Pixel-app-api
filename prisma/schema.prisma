@@ -1,0 +1,290 @@
+// Prisma ORM 7 — the datasource URL is configured in /prisma.config.ts
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  runtime             = "nodejs"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id             Int                 @id @default(autoincrement())
+  bookOrders     BookPrintOrder[]
+  bookRatings    UserBookRating[]
+  libraryRatings UserLibraryRating[]
+  account        UserAccount         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId      Int                 @unique
+}
+
+model Admin {
+  id                     Int            @id @default(autoincrement())
+  account                UserAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId              Int            @unique
+  activatedSubscriptions Subscription[] @relation("SubscriptionActivation")
+}
+
+/// Notifications target a UserAccount (not a User), so any role — a user OR a library —
+/// can receive one (e.g. order-status updates sent to both parties).
+model Notification {
+  id        Int         @id @default(autoincrement())
+  account   UserAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId Int         @map("account_id")
+  content   String
+  // Optional context for the client (e.g. "ORDER_STATUS") and the related order.
+  type      String?
+  orderId   Int?        @map("order_id")
+  createdAt DateTime    @default(now()) @map("created_at")
+  readAt    DateTime?   @map("read_at")
+
+  @@index([accountId, readAt, createdAt])
+  @@index([accountId, id])
+  @@map("notifications")
+}
+
+model UserAccount {
+  id            Int            @id @default(autoincrement())
+  firstname     String?
+  role          UserRole
+  lastname      String?
+  username      String?        @unique
+  password      String
+  createdAt     DateTime       @default(now())
+  status        AccountStatus  @default(ACTIVE)
+  user          User?
+  admin         Admin?
+  library       Library?
+  refreshTokens RefreshToken[]
+  notifications Notification[]
+
+  @@index([role, status])
+  @@index([createdAt])
+}
+
+/// Opaque refresh tokens. Only the SHA-256 hash of the token is stored; the raw
+/// value exists only in the client. This table is the single source of truth for
+/// session validity — revoking a row (logout / ban / rotation) invalidates it at once.
+model RefreshToken {
+  id                  Int         @id @default(autoincrement())
+  account             UserAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId           Int
+  tokenHash           String      @unique
+  expiresAt           DateTime
+  createdAt           DateTime    @default(now())
+  revokedAt           DateTime?
+  // Set when this token is rotated; lets us detect reuse of an already-rotated token.
+  replacedByTokenHash String?
+  userAgent           String?
+  ip                  String?
+
+  @@index([accountId, revokedAt, expiresAt])
+}
+
+/// Append-only audit trail. Intentionally denormalized (no FKs) so entries survive
+/// deletion of the actor/target — an audit log must not change after the fact.
+model AuditLog {
+  id             Int       @id @default(autoincrement())
+  action         String
+  actorAccountId Int?
+  actorRole      UserRole?
+  targetType     String?
+  targetId       String?
+  metadata       Json?
+  ip             String?
+  createdAt      DateTime  @default(now())
+
+  @@index([createdAt])
+  @@index([action, createdAt])
+  @@index([actorAccountId, createdAt])
+  @@index([targetType, targetId])
+}
+
+model UserLibraryRating {
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    Int
+  library   Library  @relation(fields: [libraryId], references: [id], onDelete: Cascade)
+  libraryId Int
+  rating    Int
+  ratedAt   DateTime @default(now())
+
+  @@id([userId, libraryId])
+  @@index([libraryId, ratedAt])
+  @@index([libraryId, rating])
+}
+
+model UserBookRating {
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId  Int
+  book    Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  bookId  Int
+  rating  Int
+  ratedAt DateTime @default(now())
+
+  @@id([userId, bookId])
+  @@index([bookId, ratedAt])
+  @@index([bookId, rating])
+}
+
+model Library {
+  id            Int                 @id @default(autoincrement())
+  location      String
+  // Coordinates are two scalar columns (not Float[]) so the bounding-box query can
+  // use a composite B-tree index and stay inside Prisma.
+  latitude      Float
+  longitude     Float
+  title         String
+  // Flat per-library print rates shared by all books in the library.
+  pagePrice     Int                 @map("page_price")
+  extraFees     Int                 @map("extra_fees")
+  // ── Derived cache of UserLibraryRating (SSOT = the ratings rows). Maintained in
+  //    the same transaction as every rating write; never written to directly. ──
+  avgRating     Float               @default(0) @map("avg_rating")
+  ratingCount   Int                 @default(0) @map("rating_count")
+  account       UserAccount         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId     Int                 @unique
+  bookOrders    BookPrintOrder[]
+  userRatings   UserLibraryRating[]
+  subscriptions Subscription[]
+
+  // Full-text search over (title || ' ' || location). Generated column maintained by
+  // Postgres (see prisma/sql/001_search_vectors.sql). Excluded from the client; query via raw SQL.
+  searchVector  Unsupported("tsvector")?
+
+  @@index([latitude, longitude])
+  @@index([title])
+  @@index([pagePrice])
+  @@index([avgRating])
+}
+
+model Plan {
+  id            Int            @id @default(autoincrement())
+  name          String         @unique
+  description   String?
+  durationDays  Int
+  price         Int
+  isActive      Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  subscriptions Subscription[]
+
+  @@index([isActive, price])
+}
+
+model Subscription {
+  id                 Int       @id @default(autoincrement())
+  libraryId          Int
+  planId             Int
+  durationDays       Int // Snapshot of the plan duration
+  requestedAt        DateTime  @default(now())
+  activatedAt        DateTime?
+  expiresAt          DateTime?
+  activatedByAdminId Int?
+  library            Library   @relation(fields: [libraryId], references: [id], onDelete: Cascade)
+  plan               Plan      @relation(fields: [planId], references: [id], onDelete: Restrict)
+  activatedByAdmin   Admin?    @relation("SubscriptionActivation", fields: [activatedByAdminId], references: [id], onDelete: SetNull)
+
+  @@index([libraryId, activatedAt, expiresAt])
+  @@index([expiresAt, activatedAt, libraryId])
+  @@index([activatedAt, requestedAt])
+  @@index([planId])
+  @@index([activatedByAdminId])
+}
+
+model Book {
+  id           Int              @id @default(autoincrement())
+  title        String
+  pages        Int
+  thumbnailUrl String?
+  // The book's PDF lives in the `files` table / Supabase Storage. One file per book.
+  file         File?            @relation(fields: [fileId], references: [id], onDelete: Restrict)
+  fileId       Int?             @unique @map("file_id")
+  // ── Derived cache of UserBookRating (SSOT = the ratings rows). ──
+  avgRating    Float            @default(0) @map("avg_rating")
+  ratingCount  Int              @default(0) @map("rating_count")
+  createdAt    DateTime         @default(now()) @map("created_at")
+  categories   Category[]
+  requests     BookPrintOrder[]
+  userRatings  UserBookRating[]
+
+  searchVector Unsupported("tsvector")?
+
+  @@index([title])
+  @@index([pages])
+  @@index([avgRating])
+  @@index([createdAt])
+}
+
+/// Uploaded files (book PDFs), isolated from the domain tables.
+/// Lifecycle: PENDING (upload URL issued) → CHECKED (size/mime/virus verified).
+model File {
+  id        Int        @id @default(autoincrement())
+  // Object key within the Supabase Storage bucket.
+  path      String     @unique
+  status    FileStatus @default(PENDING)
+  mimeType  String?    @map("mime_type")
+  size      Int?
+  createdAt DateTime   @default(now()) @map("created_at")
+  book      Book?
+
+  @@index([status, createdAt])
+  @@map("files")
+}
+
+model Category {
+  id    Int    @id @default(autoincrement())
+  name  String @unique
+  books Book[]
+}
+
+model BookPrintOrder {
+  id        Int                  @id @default(autoincrement())
+  sender    User                 @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  book      Book                 @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  bookId    Int
+  senderId  Int
+  status    BookPrintOrderStatus @default(PENDING)
+  library   Library              @relation(fields: [libraryId], references: [id], onDelete: Cascade)
+  libraryId Int
+  sentAt    DateTime             @default(now())
+
+  // ── Price snapshot, frozen at order time (protects the order from later price changes) ──
+  //    Pricing is a flat per-library rate: totalPrice = pageCount * snapshotPagePrice + snapshotExtraFees
+  pageCount         Int
+  snapshotPagePrice Int @map("snapshot_page_price")
+  snapshotExtraFees Int @map("snapshot_extra_fees")
+  totalPrice        Int @map("total_price")
+
+  @@index([senderId, status, sentAt])
+  @@index([libraryId, status, sentAt])
+  @@index([bookId])
+}
+
+enum BookPrintOrderStatus {
+  PENDING
+  ACCEPTED
+  FULFILLED
+  REJECTED
+  CANCELLED
+  RECEIVED
+}
+
+enum FileStatus {
+  PENDING
+  CHECKED
+}
+
+enum UserRole {
+  USER
+  ADMIN
+  LIBRARY
+}
+
+enum AccountStatus {
+  ACTIVE
+  BANNED
+  SUSPENDED
+  DELETED
+}
